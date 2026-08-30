@@ -71,4 +71,23 @@ describe('resolveGroupResponders — routing by relevance', () => {
 
     expect(names(resolveGroupResponders(log, MEMBERS))).toContain('health-coordinator')
   })
+
+  it('recognises an inflected verb, not just the dictionary noun', () => {
+    // Measured against a real room: "estou pesando 73.5kg" matched nothing, so
+    // every member woke and two paid a full call to answer "(pass)". People
+    // conjugate — the table has to hold stems, not headwords.
+    const responders = names(resolveGroupResponders(userSays('estou pesando 73.5kg'), MEMBERS))
+
+    expect(responders).toContain('health-coordinator')
+    expect(responders).not.toContain('workspace-expert')
+    expect(responders).not.toContain('finance-coordinator')
+  })
+
+  it('leaves a weight in a shopping list alone', () => {
+    // The counterweight to the stems above: `kg` is deliberately absent from
+    // the table, because a quantity is not a body measurement.
+    expect(
+      resolveGroupResponders(userSays('compra 5kg de arroz'), MEMBERS)
+    ).toHaveLength(4)
+  })
 })

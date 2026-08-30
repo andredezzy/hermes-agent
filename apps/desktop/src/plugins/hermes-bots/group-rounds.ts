@@ -170,7 +170,14 @@ const GROUP_DOMAIN_TERMS: Record<string, readonly string[]> = {
     'sleep',
     'recovery',
     'recuperacao',
+    // Stems, not whole words: matching is substring-based, and people write
+    // "estou pesando 73.5kg" far more often than the noun. 'kg' is left out on
+    // purpose — it would claim "5kg de açúcar na lista" for the health bot.
     'peso',
+    'pesa',
+    'pesei',
+    'pesando',
+    'weight',
     'corrida',
     'cardio'
   ],
