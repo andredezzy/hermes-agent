@@ -682,11 +682,18 @@ class _EmbeddedCuaDaemon:
     """
 
     _START_TIMEOUT_SECONDS = 15.0
-    # A readiness probe opens the daemon socket and waits for a reply. Two
-    # seconds is under what a cold `open -n -g -a` launch needs on macOS, so
-    # every probe timed out and the daemon was declared dead while it was
-    # still coming up.
     _PROBE_TIMEOUT_SECONDS = 6.0
+    """How long a single readiness probe may take.
+
+    `status` opens the daemon socket and waits for a reply, so it cannot answer
+    before the daemon binds — and a cold `open -n -g -a` launch needs ~2.5s on
+    macOS. The old 2s ceiling killed every probe just before it could succeed,
+    and the daemon was declared dead while it was still coming up.
+
+    Each probe is additionally clamped to the time left in the overall startup
+    budget, so raising this ceiling cannot push a failing start past
+    `_START_TIMEOUT_SECONDS`.
+    """
 
     def __init__(
         self,
@@ -848,7 +855,10 @@ class _EmbeddedCuaDaemon:
                     stdin=subprocess.DEVNULL,
                     capture_output=True,
                     text=True,
-                    timeout=self._PROBE_TIMEOUT_SECONDS,
+                    timeout=min(
+                        self._PROBE_TIMEOUT_SECONDS,
+                        max(deadline - time.monotonic(), 0.1),
+                    ),
                     env=env,
                 )
             except subprocess.TimeoutExpired:

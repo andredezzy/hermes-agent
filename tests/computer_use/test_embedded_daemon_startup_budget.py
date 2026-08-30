@@ -159,3 +159,46 @@ def test_timed_out_probes_are_named_in_the_failure(
     with pytest.raises(RuntimeError, match="readiness probe timed out"):
         daemon.start()
 
+
+def test_a_probe_cannot_outlive_the_startup_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each probe is clamped to the time the daemon has left.
+
+    Raising the per-probe ceiling to 6s is only safe if it cannot extend the
+    overall deadline: a probe entered just under the wire would otherwise run
+    its full timeout and push a failing start to 21s, silently spending time
+    the caller did not agree to.
+    """
+    clock = {"now": 0.0}
+    timeouts: list[float] = []
+
+    def fake_run(args: Any, **kw: Any) -> subprocess.CompletedProcess[str]:
+        if isinstance(args, (list, tuple)) and "status" in args:
+            timeouts.append(kw["timeout"])
+            clock["now"] += kw["timeout"]
+            raise subprocess.TimeoutExpired(cmd=list(args), timeout=kw["timeout"])
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(cua_backend.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(cua_backend.subprocess, "run", fake_run)
+    monkeypatch.setattr(cua_backend.subprocess, "Popen", lambda *a, **k: _FakeProcess())
+    monkeypatch.setattr(cua_backend, "_embedded_daemon_spawn_command",
+                        lambda cmd, args, **_kw: [cmd, *args])
+    monkeypatch.setattr(cua_backend, "_resolve_mcp_invocation_uncached",
+                        lambda cmd, **_kw: (cmd, ["mcp"]))
+    monkeypatch.setattr(cua_backend, "_MCP_INVOCATION_CACHE", {})
+    monkeypatch.setattr(cua_backend._EmbeddedCuaDaemon, "_START_TIMEOUT_SECONDS", 10.0)
+
+    daemon = cua_backend._EmbeddedCuaDaemon("/usr/local/bin/cua-driver", "unrestricted")
+
+    with pytest.raises(RuntimeError):
+        daemon.start()
+
+    assert clock["now"] <= 10.0, (
+        f"startup overran its 10s budget by {clock['now'] - 10.0:g}s"
+    )
+    assert timeouts[-1] < cua_backend._EmbeddedCuaDaemon._PROBE_TIMEOUT_SECONDS, (
+        "the last probe was not clamped to the remaining budget"
+    )
+
