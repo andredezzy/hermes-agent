@@ -79,11 +79,14 @@ describe('group message prose', () => {
     expect(GROUP_MESSAGE_PROSE_CLASS).toContain('font-semibold')
   })
 
-  it('declares its classes where Tailwind can find them', () => {
-    // Tailwind v4 scans source text: a class built by concatenation or template
-    // interpolation is invisible to the scanner and silently never reaches the
-    // stylesheet. The first version of this constant was assembled with `+` and
-    // every assertion above still passed while the page rendered unstyled.
+  it('declares its own classes where Tailwind can find them', () => {
+    // Tailwind v4 scans source text: a class built by concatenation is invisible
+    // to the scanner and silently never reaches the stylesheet. An earlier
+    // version of this constant was assembled with `+` and every assertion above
+    // still passed while the room rendered unstyled.
+    //
+    // Interpolating HEADING_DESCENDANT_CLASS is fine — it is a literal in its
+    // own module, which is where the scanner reads it. Anything else is not.
     const source = readFileSync(
       resolve(process.cwd(), 'src/plugins/hermes-bots/group-chat-view.tsx'),
       'utf8'
@@ -92,6 +95,9 @@ describe('group message prose', () => {
 
     expect(declaration).not.toBeNull()
     expect(declaration![1]).not.toContain('+')
-    expect(declaration![1]).not.toContain('${')
+
+    const interpolated = [...declaration![1].matchAll(/\$\{([^}]*)\}/g)].map(m => m[1].trim())
+
+    expect(interpolated).toEqual(['HEADING_DESCENDANT_CLASS'])
   })
 })

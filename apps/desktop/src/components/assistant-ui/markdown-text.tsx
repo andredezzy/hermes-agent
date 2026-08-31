@@ -11,6 +11,7 @@ import type { code as streamdownCode } from '@streamdown/code'
 import { type ComponentProps, memo, useEffect, useMemo, useState } from 'react'
 
 import { ExpandableBlock } from '@/components/chat/expandable-block'
+import { HEADING_SIZES as SHARED_HEADING_SIZES } from '@/components/chat/heading-scale'
 import { PreviewAttachment } from '@/components/chat/preview-attachment'
 import { chunkByLines, SyntaxHighlighter } from '@/components/chat/shiki-highlighter'
 import { ZoomableImage } from '@/components/chat/zoomable-image'
@@ -451,14 +452,9 @@ interface MarkdownTextSurfaceProps {
   disableArtifacts?: boolean
 }
 
-// Headings shrink to chat scale rather than the prose default (h1≈xl). Kept
-// table-driven so adding/tweaking levels is one row.
-const HEADING_SIZES: Record<'h1' | 'h2' | 'h3' | 'h4', string> = {
-  h1: 'text-[1rem] tracking-tight',
-  h2: 'text-[0.9375rem] tracking-tight',
-  h3: 'text-[0.875rem]',
-  h4: 'text-[0.8125rem]'
-}
+// Headings shrink to chat scale rather than the prose default (h1≈xl). The
+// scale itself lives in one module so every markdown surface moves together.
+const HEADING_SIZES = SHARED_HEADING_SIZES
 
 const MARKDOWN_CONTAINER_CLASS_NAME = cn(
   'aui-md prose w-full max-w-none overflow-hidden text-[length:var(--conversation-text-font-size)] leading-(--dt-line-height) text-foreground',

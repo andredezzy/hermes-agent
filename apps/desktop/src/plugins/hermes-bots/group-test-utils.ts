@@ -424,6 +424,7 @@ export async function pluginSdkMock(host: Record<string, unknown>) {
     blobatarSvg: undefined,
     computed: nanostores.computed,
     createBudgetedLoop: undefined,
+    HEADING_DESCENDANT_CLASS: undefined,
     host,
     SkillsView: undefined,
     Streamdown: undefined,

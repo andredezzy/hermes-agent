@@ -1412,6 +1412,20 @@ export { SidebarRowLead } from '@/app/chat/sidebar/chrome'
  *  switcher, the fleet profile rail and any plugin rail listing gateways share
  *  it, so a connection looks the same wherever it is named. */
 export { ConnectionGlyph } from '@/app/chat/sidebar/connection-glyph'
+/** The one heading scale every markdown surface renders with — main thread,
+ *  tool output, group rooms. Chat headings are not document headings: the
+ *  browser default puts h1 at 2em, which reads as a title dropped into a
+ *  message. Use `headingClass(level)` when you supply element components, or
+ *  `HEADING_DESCENDANT_CLASS` when you style a markdown subtree from outside.
+ *  Spell the sizes yourself and your surface drifts from the rest of the app
+ *  the moment the scale moves. */
+export {
+  HEADING_DESCENDANT_CLASS,
+  HEADING_REM,
+  HEADING_SIZES,
+  headingClass,
+  type HeadingLevel
+} from '@/components/chat/heading-scale'
 export { SIDEBAR_ROW_LEAD, SIDEBAR_TRUNCATED_LEADING } from '@/app/chat/sidebar/row-geometry'
 export { PALETTE_AREA, type PaletteContribution } from '@/app/command-palette/contrib'
 /** THE master-detail toolkit core uses for list+inspector surfaces (Scheduled

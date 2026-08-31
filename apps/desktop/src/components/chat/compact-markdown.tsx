@@ -2,6 +2,7 @@ import type { ComponentProps, ElementType, FC } from 'react'
 import { memo } from 'react'
 import { Streamdown } from 'streamdown'
 
+import { headingClass } from '@/components/chat/heading-scale'
 import { ExternalLink } from '@/lib/external-link'
 import { cn } from '@/lib/utils'
 
@@ -12,10 +13,10 @@ import { cn } from '@/lib/utils'
 
 const TAG_CLASSES = {
   blockquote: 'mt-2 mb-2 border-l-2 border-(--ui-stroke-tertiary) pl-2.5 italic text-muted-foreground/85',
-  h1: 'mt-3 mb-1.5 text-sm font-semibold tracking-tight text-foreground first:mt-0',
-  h2: 'mt-3 mb-1.5 text-[0.82rem] font-semibold tracking-tight text-foreground first:mt-0',
-  h3: 'mt-2.5 mb-1 text-[0.78rem] font-semibold text-foreground first:mt-0',
-  h4: 'mt-2 mb-1 text-[0.74rem] font-semibold text-foreground first:mt-0',
+  h1: `${headingClass('h1')} text-foreground`,
+  h2: `${headingClass('h2')} text-foreground`,
+  h3: `${headingClass('h3')} text-foreground`,
+  h4: `${headingClass('h4')} text-foreground`,
   hr: 'my-2 border-(--ui-stroke-tertiary)',
   li: 'marker:text-muted-foreground/60',
   ol: 'mb-2 list-decimal pl-5 last:mb-0',
