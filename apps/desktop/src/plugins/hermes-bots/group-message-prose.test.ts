@@ -1,3 +1,6 @@
+import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
+
 import { describe, expect, it } from 'vitest'
 
 import { GROUP_MESSAGE_PROSE_CLASS } from './group-chat-view'
@@ -61,5 +64,21 @@ describe('group message prose', () => {
     // Once a heading is only ~15% larger than the body, weight is what makes it
     // read as a heading at all.
     expect(GROUP_MESSAGE_PROSE_CLASS).toContain('font-semibold')
+  })
+
+  it('declares its classes where Tailwind can find them', () => {
+    // Tailwind v4 scans source text: a class built by concatenation or template
+    // interpolation is invisible to the scanner and silently never reaches the
+    // stylesheet. The first version of this constant was assembled with `+` and
+    // every assertion above still passed while the page rendered unstyled.
+    const source = readFileSync(
+      resolve(process.cwd(), 'src/plugins/hermes-bots/group-chat-view.tsx'),
+      'utf8'
+    )
+    const declaration = /export const GROUP_MESSAGE_PROSE_CLASS\s*=([^\n]*\n[^\n]*)/.exec(source)
+
+    expect(declaration).not.toBeNull()
+    expect(declaration![1]).not.toContain('+')
+    expect(declaration![1]).not.toContain('${')
   })
 })
