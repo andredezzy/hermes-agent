@@ -41,14 +41,27 @@ describe('group message prose', () => {
     expect(Object.keys(sizes).sort()).toEqual(['h1', 'h2', 'h3', 'h4'])
   })
 
-  it('keeps headings within a chat-scale ratio of the body', () => {
-    // The main thread runs h1 at 1.14x body. A heading is a label in a chat
-    // message, not a page title — past ~1.3x it reads as a document.
+  it('gives headings the same absolute size they get in the main thread', () => {
+    // Ratio does not transport between surfaces. Basing these on the main
+    // thread's 1.14x produced a 14px h1 against a 12px body — a smaller heading
+    // than the same text gets one pane over, and too faint to scan. A reader
+    // recognises a heading by its actual size, so match the sizes, and let the
+    // ratio land where the smaller body puts it.
+    const sizes = headingSizes(GROUP_MESSAGE_PROSE_CLASS)
+
+    expect(sizes.h1).toBe(1)
+    expect(sizes.h2).toBe(0.9375)
+    expect(sizes.h3).toBe(0.875)
+  })
+
+  it('keeps a heading from reading as a document title', () => {
+    // The browser default is 2em. That is the failure this class exists to fix,
+    // and the ceiling that keeps a future edit from drifting back to it.
     const body = bodySize(GROUP_MESSAGE_PROSE_CLASS)
     const sizes = headingSizes(GROUP_MESSAGE_PROSE_CLASS)
 
     expect(body).toBeGreaterThan(0)
-    expect(sizes.h1 / body).toBeLessThanOrEqual(1.3)
+    expect(sizes.h1 / body).toBeLessThan(1.6)
     expect(sizes.h1 / body).toBeGreaterThan(1)
   })
 

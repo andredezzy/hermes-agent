@@ -106,17 +106,23 @@ const Streamdown = typeof sdk === 'undefined' ? undefined : sdk.Streamdown
  *
  *  Streamdown emits bare `h1`…`h4`, so without explicit sizes they land on the
  *  browser defaults — h1 at 2em, twice this surface's body text, which reads as
- *  a document title dropped into a chat line. The main thread solved the same
- *  problem in `markdown-text.tsx`; these are that scale re-based onto the room's
- *  smaller body, keeping h1 at ~1.15x rather than 2x.
+ *  a document title dropped into a chat line.
  *
- *  Weight, not size, is what marks a heading once the sizes are this close —
- *  hence `font-semibold` and a slightly stronger colour than the body.
+ *  These match the ABSOLUTE heading sizes of the main thread's
+ *  `markdown-text.tsx` (h1 at 1rem), not its ratios. Copying the ratio was the
+ *  first attempt and it undershot: the room's body is 12px against the main
+ *  thread's 14px, so the same 1.14x produced a 14px h1 — smaller than the
+ *  heading the same content gets one pane over, and too faint to scan. A
+ *  reader recognises a heading by how big it actually is, so the ratio here
+ *  lands higher (1.33x) as a consequence of the smaller body, not as a target.
+ *
+ *  Weight and colour still do real work at these sizes — hence `font-semibold`
+ *  and a stronger colour than the body.
  *
  *  Written as one literal on purpose: Tailwind scans source text, so a class
  *  assembled by concatenation never reaches the generated stylesheet. */
 export const GROUP_MESSAGE_PROSE_CLASS =
-  'text-xs text-(--ui-text-secondary) [&_h1]:text-[0.875rem] [&_h2]:text-[0.8125rem] [&_h3]:text-[0.78125rem] [&_h4]:text-[0.75rem] [&_h1]:font-semibold [&_h2]:font-semibold [&_h3]:font-semibold [&_h4]:font-semibold [&_h1]:tracking-tight [&_h2]:tracking-tight [&_h1]:text-(--ui-text-primary) [&_h2]:text-(--ui-text-primary) [&_h3]:text-(--ui-text-primary) [&_h4]:text-(--ui-text-primary) [&_h1]:mt-3 [&_h2]:mt-3 [&_h3]:mt-2 [&_h4]:mt-2 [&_h1]:mb-1 [&_h2]:mb-1 [&_h3]:mb-0.5 [&_h4]:mb-0.5 [&_h1:first-child]:mt-0 [&_h2:first-child]:mt-0 [&_h3:first-child]:mt-0 [&_h4:first-child]:mt-0 [&_p]:mb-1 [&_p:last-child]:mb-0 [&_ul]:mb-1 [&_ul]:list-disc [&_ul]:pl-4 [&_ol]:mb-1 [&_ol]:list-decimal [&_ol]:pl-4 [&_pre]:overflow-x-auto [&_strong]:font-semibold [&_strong]:text-(--ui-text-primary)'
+  'text-xs text-(--ui-text-secondary) [&_h1]:text-[1rem] [&_h2]:text-[0.9375rem] [&_h3]:text-[0.875rem] [&_h4]:text-[0.8125rem] [&_h1]:font-semibold [&_h2]:font-semibold [&_h3]:font-semibold [&_h4]:font-semibold [&_h1]:tracking-tight [&_h2]:tracking-tight [&_h1]:text-(--ui-text-primary) [&_h2]:text-(--ui-text-primary) [&_h3]:text-(--ui-text-primary) [&_h4]:text-(--ui-text-primary) [&_h1]:mt-4 [&_h2]:mt-4 [&_h3]:mt-3 [&_h4]:mt-3 [&_h1]:mb-1.5 [&_h2]:mb-1.5 [&_h3]:mb-1 [&_h4]:mb-1 [&_h1:first-child]:mt-0 [&_h2:first-child]:mt-0 [&_h3:first-child]:mt-0 [&_h4:first-child]:mt-0 [&_p]:mb-1 [&_p:last-child]:mb-0 [&_ul]:mb-1 [&_ul]:list-disc [&_ul]:pl-4 [&_ol]:mb-1 [&_ol]:list-decimal [&_ol]:pl-4 [&_pre]:overflow-x-auto [&_strong]:font-semibold [&_strong]:text-(--ui-text-primary)'
 
 /** Soft-disband a group chat: remove only this group from every local member's
  *  membership list (the metadata syncs cross-machine via ui_meta), drop the
