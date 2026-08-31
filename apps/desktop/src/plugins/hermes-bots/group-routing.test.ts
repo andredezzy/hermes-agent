@@ -90,4 +90,23 @@ describe('resolveGroupResponders — routing by relevance', () => {
       resolveGroupResponders(userSays('compra 5kg de arroz'), MEMBERS)
     ).toHaveLength(4)
   })
+
+  it('leaves the coordinator out of a round that already has an addressee', () => {
+    // The coordinator rides along on a GUESS so a bad guess costs a round, not
+    // an answer. A handoff naming its target is not a guess: measured in a real
+    // room, the coordinator woke on a task already delegated to @notion-expert
+    // and spent three turns passing. Mentions are exact — trust them.
+    const log: GroupMessage[] = [
+      { at: 0, from: { kind: 'user', name: 'andre' }, text: 'cria os treinos no notion' },
+      {
+        at: 1,
+        from: { kind: 'member', name: 'health-coordinator' },
+        text: '@notion-expert cria as sessoes planejadas'
+      }
+    ]
+
+    const responders = names(resolveGroupResponders(log, MEMBERS))
+
+    expect(responders).toEqual(['notion-expert'])
+  })
 })
