@@ -3952,9 +3952,16 @@ def _classify_fetch_failure(stderr: str) -> str:
             for code in codes
         )
 
-    if _has_http_code("429") or "rate limit" in stderr.lower():
+    def _is_rate_limited() -> bool:
+        # Two shapes, one cause. HTTP surfaces a 429; SSH has no status line and
+        # closes the ref listing with a prose banner that hyphenates the phrase
+        # ("rate-limited"), so matching only "rate limit" missed it entirely.
+        lowered = stderr.lower()
+        return _has_http_code("429") or "rate limit" in lowered or "rate-limited" in lowered
+
+    if _is_rate_limited():
         return (
-            "✗ GitHub is rate limiting requests or having an outage (HTTP 429)"
+            "✗ GitHub is rate limiting requests or having an outage"
             " — try again in 5 minutes."
         )
     if _has_http_code("500", "502", "503", "504"):

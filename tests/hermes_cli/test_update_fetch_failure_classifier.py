@@ -18,6 +18,16 @@ CURL_429_STDERR = (
     "fatal: unable to access 'https://github.com/NousResearch/hermes-agent.git/':"
     " The requested URL returned error: 429"
 )
+# The SSH transport carries no HTTP status: the server closes the ref listing
+# with a prose banner, and the wording is "rate-limited", not "rate limit".
+SSH_RATE_LIMIT_STDERR = (
+    "fatal: remote error: \n"
+    " This request was rate-limited due to too many requests. Reduce the"
+    " frequency of your requests or try again later.\n"
+    "For more on scraping GitHub and how it may affect your rights, please"
+    " review our Terms of Service"
+    " (https://docs.github.com/en/site-policy/github-terms/github-terms-of-service)."
+)
 
 
 class TestClassifyFetchFailure:
@@ -35,6 +45,15 @@ class TestClassifyFetchFailure:
     def test_rate_limit_phrase_without_code(self):
         msg = update_cmd._classify_fetch_failure("fatal: GitHub rate limit exceeded")
         assert "rate limiting" in msg
+
+    def test_ssh_rate_limit_banner_is_recognised(self):
+        # Reproduced from a real `hermes update --check` against origin over SSH.
+        # There is no HTTP status on this transport and the banner hyphenates
+        # the phrase, so matching only "rate limit" left the user with the bare
+        # generic message and no hint that waiting would fix it.
+        msg = update_cmd._classify_fetch_failure(SSH_RATE_LIMIT_STDERR)
+        assert "rate limiting" in msg
+        assert "try again in 5 minutes" in msg
 
     def test_5xx_reports_outage(self):
         msg = update_cmd._classify_fetch_failure(
