@@ -3934,6 +3934,31 @@ def _run_logged_subprocess(cmd, *, cwd=None, env=None):
     _log_only_write(result.stdout or "")
     return result
 
+def _classify_merge_failure(stderr: str) -> str:
+    """Say why the in-place merge failed, and what actually fixes it.
+
+    A parked-branch update merges origin/<branch> so local commits survive.
+    Every failure used to be reported as a conflict, but on a shallow checkout
+    the far more likely cause is that the fetched branch shares no commit with
+    the local history — git refuses outright, nothing is conflicted, and the
+    advice to "resolve manually" sends the user to the same refusal. The two
+    need different remedies: one edits files, the other fetches history.
+    """
+    if "unrelated histories" in stderr:
+        return (
+            "✗ The fetched branch shares no history with this checkout — this is"
+            " a shallow clone whose history was cut before the common ancestor,"
+            " not a conflict.\n"
+            "  Deepen it, then re-run the update:"
+            " git fetch --deepen=2000 origin <branch>\n"
+            "  (repeat if needed, or 'git fetch --unshallow' to fetch it all)."
+        )
+    return (
+        "✗ Merge conflict between local commits and upstream — "
+        "update stopped, nothing was changed."
+    )
+
+
 def _classify_fetch_failure(stderr: str) -> str:
     """Map git-fetch stderr to a one-line, user-facing diagnosis.
 
@@ -8151,14 +8176,12 @@ def _cmd_update_impl(args, gateway_mode: bool):
                             capture_output=True,
                             check=False,
                         )
-                        print(
-                            "✗ Merge conflict between local commits and upstream — "
-                            "update stopped, nothing was changed."
-                        )
-                        print(
-                            f"  Resolve manually: cd {_m().PROJECT_ROOT} && "
-                            f"git merge origin/{branch}"
-                        )
+                        print(_classify_merge_failure(merge_result.stderr or ""))
+                        if "unrelated histories" not in (merge_result.stderr or ""):
+                            print(
+                                f"  Resolve manually: cd {_m().PROJECT_ROOT} && "
+                                f"git merge origin/{branch}"
+                            )
                         print(
                             "  Then re-run the update. Local work is untouched."
                         )
