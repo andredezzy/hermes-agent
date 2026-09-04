@@ -163,8 +163,15 @@ def test_shallow_local_ahead_is_not_reported_as_behind(tmp_path):
             return MagicMock(returncode=0)
         return MagicMock(returncode=0, stdout="")
 
+    def fake_git_ok(args, **kwargs):
+        # Both the fetch and the ancestry probe go through _git_ok now. The
+        # fetch must succeed, and merge-base must report the fetched tip as an
+        # ancestor of HEAD — that is what "local-ahead" looks like.
+        return args[:1] in (["fetch"], ["merge-base"])
+
     with (
         patch.object(banner, "_git_stdout", side_effect=fake_git_stdout),
+        patch.object(banner, "_git_ok", side_effect=fake_git_ok),
         patch.object(banner.subprocess, "run", side_effect=fake_run),
         # The API cannot see a local-only commit; without the git check this
         # None is what becomes a permanent false "update available".

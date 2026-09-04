@@ -9,7 +9,7 @@ and there is nothing to resolve; the fix is to deepen the fetch. Telling that
 user to run `git merge` by hand sends them to the same refusal.
 """
 
-from hermes_cli import update_cmd
+from hermes_cli import update_cmd_git as update_cmd
 
 
 UNRELATED_HISTORIES_STDERR = "fatal: refusing to merge unrelated histories"
