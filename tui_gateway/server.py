@@ -1114,14 +1114,14 @@ def _active_config_path() -> Path:
     return Path(override if isinstance(override, str) and override else _hermes_home) / "config.yaml"
 
 
-def _load_cfg_raw() -> dict:
+def _load_cfg_raw(path: Path | None = None) -> dict:
     """The active profile's config.yaml EXACTLY as written — the write-back primitive, ONLY for
     read→mutate→``_save_cfg`` round-trips and raw inspection (defaults / managed overlay / ``${VAR}``
     expansion applied here would be persisted on the next save). Behavioral reads use :func:`_load_cfg`.
     Cache keyed on the resolved path so profiles don't clobber."""
     global _cfg_cache, _cfg_mtime, _cfg_path
     with contextlib.suppress(Exception):
-        p = _active_config_path()
+        p = path or _active_config_path()
         mtime = p.stat().st_mtime if p.exists() else None
         with _cfg_lock:
             if _cfg_cache is not None and _cfg_mtime == mtime and _cfg_path == p:
@@ -1145,7 +1145,8 @@ def _load_cfg() -> dict:
     """Behavioral config read: raw user file + managed overlay + ${VAR} expansion — ``load_config_readonly``
     minus the DEFAULT_CONFIG merge (callers treat a missing key as "unset"; merging would break
     ``_load_cfg() == {}`` sentinels). Never pass the result to ``_save_cfg`` (use ``_load_cfg_raw()``)."""
-    cfg = _apply_managed(_load_cfg_raw())
+    cfg_path = _active_config_path()
+    cfg = _apply_managed(_load_cfg_raw(cfg_path))
     # A profile that opted into inheritance carries only its own overrides on
     # disk; the rest lives in the root config. Resolving it here keeps this
     # reader agreeing with hermes_cli.config.load_config — without it an
@@ -1160,9 +1161,7 @@ def _load_cfg() -> dict:
                 _normalize_root_model_keys,
             )
 
-            inherited = _normalize_root_model_keys(
-                _load_inherited_config(Path(_cfg_path or (Path(_hermes_home) / "config.yaml")))
-            )
+            inherited = _normalize_root_model_keys(_load_inherited_config(cfg_path))
             if isinstance(inherited, dict) and inherited:
                 inherited.pop("inherit", None)
                 cfg = _deep_merge(inherited, cfg)
