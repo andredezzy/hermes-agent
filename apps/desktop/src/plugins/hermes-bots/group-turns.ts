@@ -776,16 +776,13 @@ async function runGroupChatMemberTurnLeased(
     }
   }
 
-  // Timeout — clear any still-mirrored question card (the server-side
-  // clarify timeout runs its own course) and read as a pass, but remember the baseline + thread
-  // (runtime-only) so the finished reply can be posted late into the RIGHT
-  // thread instead of vanishing.
+  // The backend owns pending decisions; a room timeout must not dismiss them.
+  // Keep the baseline and thread so recovery can deliver the eventual reply.
   recordGroupActivity(group, {
     kind: 'timed-out',
     member: member.name,
     thread
   })
-  syncGroupClarify(group, member, null)
   updateGroupChat(group, (r: GroupChatRoom) => {
     r.stranded = {
       ...(r.stranded || {}),
@@ -828,13 +825,10 @@ export async function harvestStrandedGroupReply(group: string, member: GroupMemb
     return // source unreachable — leave the marker for the next boundary
   }
 
-  if (state?.inflight || state?.running) {
-    return // still grinding — keep waiting
-  }
+  // A pending decision must stay visible even while its tool holds the turn open.
+  const awaitingUser = syncGroupClarify(group, member, state)
 
-  // A stranded member blocked on a clarify is not "grinding" — surface the
-  // question card (#90694) and keep the marker until it resolves.
-  if (syncGroupClarify(group, member, state)) {
+  if (state?.inflight || state?.running || awaitingUser) {
     return
   }
 

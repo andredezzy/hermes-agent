@@ -385,6 +385,46 @@ describe('clarify and approvals (#90694)', () => {
     expect(room.chat.$groupNeedsYou.get().Core).toBe(true)
   })
 
+  it.each([
+    { kind: 'clarify', payload: CLARIFY },
+    { kind: 'approval', payload: APPROVAL }
+  ])('keeps a pending $kind answerable after the room stops waiting', async ({ kind, payload }) => {
+    let clock = Date.now()
+    const pending = { research: { payload, until: Number.POSITIVE_INFINITY } }
+
+    const room = await loadRoom({
+      onResumePoll: () => { clock += 21 * 60000 },
+      ...(kind === 'clarify' ? { clarifyUntil: pending } : { approvalUntil: pending }),
+      turn: () => 'completed after the decision'
+    })
+
+    const now = vi.spyOn(Date, 'now').mockImplementation(() => clock)
+    const member: GroupMember = { name: 'research', title: '' }
+
+    try {
+      expect(await room.turns.runGroupChatMemberTurn('Waiting', member, 'perform the task', 'original-thread')).toBeNull()
+      const entries = Object.values(room.chat.$groupClarify.get())
+
+      expect(entries).toHaveLength(1)
+      expect(entries[0]).toMatchObject({ kind, requestId: payload.request_id })
+      expect(room.chat.$groupChats.get().Waiting.stranded?.research).toEqual({ before: 0, thread: 'original-thread' })
+      expect(room.gateway.rpcFor('clarify.respond')).toHaveLength(0)
+      expect(room.gateway.rpcFor('approval.respond')).toHaveLength(0)
+
+      await room.turns.answerGroupClarify(entries[0], member, kind === 'clarify' ? 'staging' : 'once')
+      pending.research.until = 0
+      await room.turns.harvestStrandedGroupReply('Waiting', member)
+
+      expect(Object.values(room.chat.$groupClarify.get())).toHaveLength(0)
+      expect(room.gateway.rpcFor('prompt.submit')).toHaveLength(1)
+      expect(log(room, 'Waiting')).toEqual([
+        expect.objectContaining({ text: 'completed after the decision', thread: 'original-thread' })
+      ])
+    } finally {
+      now.mockRestore()
+    }
+  })
+
   it('mirrors a question, badges needs-you, and is idempotent per request', async () => {
     const { chat, turns } = await loadRoom()
     const member: GroupMember = { name: 'research', title: '' }
@@ -561,6 +601,38 @@ describe('stranded harvest', () => {
       title
     })
   }
+
+  it.each(['clarify', 'approval'])('recovers a pending %s while the stranded member is still busy', async kind => {
+    const pending = {
+      research: {
+        payload: { choices: ['yes', 'no'], description: 'Proceed?', question: 'Proceed?', request_id: 'req-pending' },
+        until: 1
+      }
+    }
+
+    const room = await loadRoom({
+      busyResumes: { research: 1 },
+      ...(kind === 'clarify' ? { clarifyUntil: pending } : { approvalUntil: pending })
+    })
+
+    room.chat.updateGroupChat('Waiting', current => {
+      current.sessions = { research: 'sid-research' }
+      current.stranded = { research: { before: 0, thread: 'original-thread' } }
+
+      return current
+    })
+    seedSession(room, 'sid-research', 'research', 'Group: Waiting', [])
+
+    await room.turns.harvestStrandedGroupReply('Waiting', { name: 'research', title: '' })
+
+    expect(Object.values(room.chat.$groupClarify.get())).toEqual([
+      expect.objectContaining({ kind, requestId: 'req-pending' })
+    ])
+    expect(room.chat.$groupNeedsYou.get().Waiting).toBe(true)
+    expect(room.chat.$groupChats.get().Waiting.stranded?.research).toEqual({ before: 0, thread: 'original-thread' })
+    expect(room.gateway.rpcFor('prompt.submit')).toHaveLength(0)
+    expect(log(room, 'Waiting')).toHaveLength(0)
+  })
 
   it('posts a late reply into the room and clears the marker', async () => {
     const room = await loadRoom()
