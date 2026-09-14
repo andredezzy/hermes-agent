@@ -117,22 +117,23 @@ def test_concurrent_profile_reads_keep_their_own_inherited_root(
     monkeypatch.setattr(server, "_cfg_mtime", None, raising=False)
     monkeypatch.setattr(server, "_cfg_path", None, raising=False)
 
-    barrier = threading.Barrier(2)
-    apply_managed = server._apply_managed
-
-    def synchronize_after_raw_read(cfg: dict) -> dict:
-        barrier.wait(timeout=5)
-        return apply_managed(cfg)
-
-    monkeypatch.setattr(server, "_apply_managed", synchronize_after_raw_read)
-    results: dict[str, str] = {}
+    # No barrier: the config lock serializes the resolution, so blocking inside
+    # it would deadlock rather than interleave. Hammer both profiles instead —
+    # a cache that ignored the profile's path would hand one thread the other's
+    # root well within these rounds.
+    results: dict[str, set[str]] = {"A": set(), "B": set()}
+    errors: list[BaseException] = []
 
     def load(name: str) -> None:
-        token = set_hermes_home_override(profiles[name])
-        try:
-            results[name] = server._load_cfg()["model"]["default"]
-        finally:
-            reset_hermes_home_override(token)
+        for _ in range(25):
+            token = set_hermes_home_override(profiles[name])
+            try:
+                results[name].add(server._load_cfg()["model"]["default"])
+            except BaseException as exc:  # noqa: BLE001 - reported below, not swallowed
+                errors.append(exc)
+                return
+            finally:
+                reset_hermes_home_override(token)
 
     threads = [threading.Thread(target=load, args=(name,)) for name in profiles]
     for thread in threads:
@@ -141,7 +142,9 @@ def test_concurrent_profile_reads_keep_their_own_inherited_root(
         thread.join(timeout=10)
 
     assert all(not thread.is_alive() for thread in threads)
-    assert results == {"A": "model-A", "B": "model-B"}
+    assert not errors
+    # Each profile only ever saw its OWN root — never the sibling's.
+    assert results == {"A": {"model-A"}, "B": {"model-B"}}
 
 
 def test_root_model_edit_reaches_profiles_without_restarting(

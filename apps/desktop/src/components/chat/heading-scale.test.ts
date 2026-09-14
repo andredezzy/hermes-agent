@@ -78,8 +78,10 @@ describe('heading scale', () => {
 
     for (const surface of MARKDOWN_SURFACES) {
       const source = sourceOf(surface)
+
       const declaresOwnSize =
         /\bh[1-4]:\s*'[^']*text-\[/.test(source) || /\[&_h[1-4]\]:text-\[/.test(source)
+
       const importsScale = /from '@?\/?[^']*heading-scale'/.test(source)
 
       if (declaresOwnSize && !importsScale) {

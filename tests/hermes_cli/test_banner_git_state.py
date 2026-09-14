@@ -55,7 +55,7 @@ def test_check_via_local_git_ssh_fastpath_ahead_not_behind(tmp_path):
     repo_dir = tmp_path / "repo"
     (repo_dir / ".git").mkdir(parents=True)
 
-    def fake_git_stdout(args, *, cwd, timeout=5):
+    def fake_git_stdout(args, *, cwd, timeout=5, network=False):
         if args == ["remote", "get-url", "origin"]:
             return "git@github.com:NousResearch/hermes-agent.git"
         if args == ["rev-parse", "HEAD"]:
@@ -64,7 +64,7 @@ def test_check_via_local_git_ssh_fastpath_ahead_not_behind(tmp_path):
 
     with (
         patch.object(banner, "_git_stdout", side_effect=fake_git_stdout),
-        patch.object(banner, "_upstream_main_sha", return_value="a" * 40),
+        patch.object(banner, "_github_branch_tip", return_value="a" * 40),
         # merge-base --is-ancestor exits 0: upstream tip IS an ancestor of HEAD
         patch.object(banner.subprocess, "run", return_value=MagicMock(returncode=0)),
     ):
@@ -82,7 +82,7 @@ def test_check_via_local_git_ssh_fastpath_genuinely_behind(tmp_path):
     repo_dir = tmp_path / "repo"
     (repo_dir / ".git").mkdir(parents=True)
 
-    def fake_git_stdout(args, *, cwd, timeout=5):
+    def fake_git_stdout(args, *, cwd, timeout=5, network=False):
         if args == ["remote", "get-url", "origin"]:
             return "git@github.com:NousResearch/hermes-agent.git"
         if args == ["rev-parse", "HEAD"]:
@@ -91,7 +91,7 @@ def test_check_via_local_git_ssh_fastpath_genuinely_behind(tmp_path):
 
     with (
         patch.object(banner, "_git_stdout", side_effect=fake_git_stdout),
-        patch.object(banner, "_upstream_main_sha", return_value="a" * 40),
+        patch.object(banner, "_github_branch_tip", return_value="a" * 40),
         # merge-base --is-ancestor exits 1: not an ancestor -> genuinely behind
         patch.object(banner.subprocess, "run", return_value=MagicMock(returncode=1)),
         patch.object(banner, "_github_compare_behind", return_value=3),
@@ -110,7 +110,7 @@ def test_check_via_local_git_ssh_fastpath_offline_keeps_sentinel(tmp_path):
     repo_dir = tmp_path / "repo"
     (repo_dir / ".git").mkdir(parents=True)
 
-    def fake_git_stdout(args, *, cwd, timeout=5):
+    def fake_git_stdout(args, *, cwd, timeout=5, network=False):
         if args == ["remote", "get-url", "origin"]:
             return "git@github.com:NousResearch/hermes-agent.git"
         if args == ["rev-parse", "HEAD"]:
@@ -119,7 +119,7 @@ def test_check_via_local_git_ssh_fastpath_offline_keeps_sentinel(tmp_path):
 
     with (
         patch.object(banner, "_git_stdout", side_effect=fake_git_stdout),
-        patch.object(banner, "_upstream_main_sha", return_value="a" * 40),
+        patch.object(banner, "_github_branch_tip", return_value="a" * 40),
         patch.object(banner.subprocess, "run", return_value=MagicMock(returncode=1)),
         patch.object(banner, "_github_compare_behind", return_value=None),
     ):
@@ -128,93 +128,70 @@ def test_check_via_local_git_ssh_fastpath_offline_keeps_sentinel(tmp_path):
     assert behind == banner.UPDATE_AVAILABLE_NO_COUNT
 
 
-def test_shallow_local_ahead_is_not_reported_as_behind(tmp_path):
-    """A carried commit on a shallow clone is ahead, not behind.
+def test_check_via_local_git_insteadof_rewrite_routes_to_ssh_fastpath(tmp_path, monkeypatch):
+    """#104591: the origin-URL probe must run under the fetch's config-isolated env.
 
-    The shallow path cannot count across its boundary, so it asks the GitHub
-    compare API. A commit that exists only locally 404s there, and treating
-    that silence as "behind" nags the user to update forever — an update that
-    can never clear the notice, since the carried commit is the point.
-    Git already knows the answer: fetched tip reachable from HEAD means ahead.
+    A global ``url.<https>.insteadOf`` rewrite makes a plain ``git remote get-url origin``
+    report HTTPS for an SSH origin, so the SSH-avoiding fast path is skipped — while the
+    fetch itself drops global config (``GIT_CONFIG_GLOBAL=/dev/null``), dials the raw SSH
+    origin, and its host-key prompt opens /dev/tty and steals the CLI's keystrokes. With the
+    probe under the same isolated env both sides observe the raw SSH URL and the HTTPS
+    ls-remote fast path runs instead — no fetch, no ssh child.
     """
-    from unittest.mock import MagicMock
+    import os
+    import subprocess
 
     from hermes_cli import banner
 
     repo_dir = tmp_path / "repo"
-    (repo_dir / ".git").mkdir(parents=True)
+    repo_dir.mkdir()
+    # Config-isolated setup so the developer's own global git config can't leak in.
+    setup_env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull}
+    setup_cmds = [
+        ["git", "init", "-q"],
+        # Pinned identity: with global/system config nulled, CI runners whose bare
+        # hostname makes git's auto-detected ident "user@host.(none)" reject the commit.
+        ["git", "-c", "user.email=t@t", "-c", "user.name=t",
+         "commit", "--allow-empty", "-q", "-m", "init"],
+        ["git", "remote", "add", "origin", "git@github.com:NousResearch/hermes-agent.git"],
+        ["git", "rev-parse", "HEAD"],
+    ]
+    head_sha = None
+    for argv in setup_cmds:
+        done = subprocess.run(
+            argv, cwd=repo_dir, env=setup_env, check=True, capture_output=True, text=True)
+        if argv[1] == "rev-parse":
+            head_sha = done.stdout.strip()
+    assert head_sha
 
-    def fake_git_stdout(args, *, cwd, timeout=5):
-        if args == ["remote", "get-url", "origin"]:
-            return "https://github.com/NousResearch/hermes-agent.git"
-        if args == ["rev-parse", "--is-shallow-repository"]:
-            return "true"
-        if args == ["rev-parse", "HEAD"]:
-            return "b" * 40
-        if args == ["rev-parse", "FETCH_HEAD"]:
-            return "a" * 40
-        return ""
+    # Global config (visible only without GIT_CONFIG_GLOBAL isolation) rewrites SSH to HTTPS.
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".gitconfig").write_text(
+        '[url "https://github.com/"]\n\tinsteadOf = git@github.com:\n', encoding="utf-8")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))  # Git for Windows resolves global config here too
 
-    def fake_run(cmd, **kwargs):
-        if cmd[:2] == ["git", "fetch"]:
-            return MagicMock(returncode=0)
-        if cmd[:2] == ["git", "merge-base"]:
-            # Fetched tip IS an ancestor of HEAD: local-ahead.
-            return MagicMock(returncode=0)
-        return MagicMock(returncode=0, stdout="")
+    calls = []
+    real_run = banner.subprocess.run
 
-    def fake_git_ok(args, **kwargs):
-        # Both the fetch and the ancestry probe go through _git_ok now. The
-        # fetch must succeed, and merge-base must report the fetched tip as an
-        # ancestor of HEAD — that is what "local-ahead" looks like.
-        return args[:1] in (["fetch"], ["merge-base"])
+    def spy_run(args, **kwargs):
+        calls.append((list(args), kwargs))
+        if args[1] in {"ls-remote", "fetch"}:
+            raise AssertionError(f"a GitHub origin must be probed via the API, not git {args[1]}")
+        return real_run(args, **kwargs)
 
-    with (
-        patch.object(banner, "_git_stdout", side_effect=fake_git_stdout),
-        patch.object(banner, "_git_ok", side_effect=fake_git_ok),
-        patch.object(banner.subprocess, "run", side_effect=fake_run),
-        # The API cannot see a local-only commit; without the git check this
-        # None is what becomes a permanent false "update available".
-        patch.object(banner, "_github_compare_behind", return_value=None),
-    ):
-        behind = banner._check_via_local_git(repo_dir)
+    monkeypatch.setattr(banner.subprocess, "run", spy_run)
+    monkeypatch.setattr(banner, "_github_branch_tip", lambda slug, branch: head_sha)
 
+    behind = banner._check_via_local_git(repo_dir)
+
+    # Same upstream tip as HEAD: the SSH fast path concludes "not behind".
     assert behind == 0
-
-
-def test_shallow_genuinely_behind_still_reports_the_sentinel(tmp_path):
-    """The ahead check must not swallow a real update when the API is quiet."""
-    from unittest.mock import MagicMock
-
-    from hermes_cli import banner
-
-    repo_dir = tmp_path / "repo"
-    (repo_dir / ".git").mkdir(parents=True)
-
-    def fake_git_stdout(args, *, cwd, timeout=5):
-        if args == ["remote", "get-url", "origin"]:
-            return "https://github.com/NousResearch/hermes-agent.git"
-        if args == ["rev-parse", "--is-shallow-repository"]:
-            return "true"
-        if args == ["rev-parse", "HEAD"]:
-            return "b" * 40
-        if args == ["rev-parse", "FETCH_HEAD"]:
-            return "a" * 40
-        return ""
-
-    def fake_run(cmd, **kwargs):
-        if cmd[:2] == ["git", "fetch"]:
-            return MagicMock(returncode=0)
-        if cmd[:2] == ["git", "merge-base"]:
-            # Not an ancestor: the fetched tip carries commits HEAD lacks.
-            return MagicMock(returncode=1)
-        return MagicMock(returncode=0, stdout="")
-
-    with (
-        patch.object(banner, "_git_stdout", side_effect=fake_git_stdout),
-        patch.object(banner.subprocess, "run", side_effect=fake_run),
-        patch.object(banner, "_github_compare_behind", return_value=None),
-    ):
-        behind = banner._check_via_local_git(repo_dir)
-
-    assert behind == banner.UPDATE_AVAILABLE_NO_COUNT
+    assert not any(args[1] == "fetch" for args, _ in calls), (
+        "insteadOf rewrite must not smuggle the check into the fetch branch")
+    probe = next(
+        (kwargs for args, kwargs in calls if args[1:3] == ["remote", "get-url"]), None)
+    assert probe is not None
+    assert probe["env"]["GIT_CONFIG_GLOBAL"] == os.devnull, (
+        "the origin-URL probe must observe the URL the isolated fetch will dial")

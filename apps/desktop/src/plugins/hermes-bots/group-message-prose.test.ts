@@ -91,6 +91,7 @@ describe('group message prose', () => {
       resolve(process.cwd(), 'src/plugins/hermes-bots/group-chat-view.tsx'),
       'utf8'
     )
+
     const declaration = /export const GROUP_MESSAGE_PROSE_CLASS\s*=([^\n]*\n[^\n]*)/.exec(source)
 
     expect(declaration).not.toBeNull()
