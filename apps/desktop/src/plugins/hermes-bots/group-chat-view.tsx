@@ -71,6 +71,7 @@ import {
 import type { GroupChatRoom } from './group-chat'
 import { GroupClarifyCard, GroupImageControls, GroupMentionInput } from './group-chat-parts'
 import type { GroupRoomPrompt } from './group-chat-parts'
+import { GroupMemberPicker } from './group-chat-view-members'
 import { GroupHoldStatus } from './group-hold-status'
 import {
   botGroups,
@@ -79,6 +80,7 @@ import {
   groupWorkspaceOwnerKey,
   liveGroupChatNames
 } from './group-membership'
+import { groupMentionComponents, groupMentionText } from './group-mention-text'
 import {
   clearGroupComposerDraft,
   closeGroupChatMainTab,
@@ -92,15 +94,22 @@ import {
   updateGroupComposerDraft
 } from './group-panes'
 import type { GroupComposerDraft, GroupDraftSetter } from './group-panes'
-import { sendToGroupChat, stopGroupThread } from './group-rounds'
+import { groupReplyMentionTag, sendToGroupChat, stopGroupThread } from './group-rounds'
 import { clearGroupClarify, renameGroupClarify } from './group-turns'
 import { botsText, useBots } from './i18n'
-import { displayName, slugify } from './labels'
-import { botRosterMeta, setBotsWorkspaceOwner } from './routing'
+import { displayName, slugifyProfileName } from './labels'
+import { botRosterMeta, groupTranscriptSpeakerMeta, setBotsWorkspaceOwner } from './routing'
 import { bumpBotOpenGeneration, getPluginCtx, ID } from './shared'
 import type { Attachment, BotMeta, GroupChat, GroupMember, GroupMessage, RosterRow } from './types'
 
 const Streamdown = typeof sdk === 'undefined' ? undefined : sdk.Streamdown
+// The 1:1 chat's message renderer: `MEDIA:` lines become inline players and
+// images instead of a raw path (#93728), and a fenced block gets the app's own
+// code card — stock Streamdown lays a code block's header and body out as
+// inline siblings, so the body sat shifted right and its tail was clipped with
+// no scrollbar (#91878). Feature-detected: an older shell without the export
+// keeps the raw Streamdown path.
+const MessageTextContent = typeof sdk === 'undefined' ? undefined : sdk.MessageTextContent
 
 /** The shared heading scale, via the plugin SDK — plugins reach core through the
  *  SDK, never by importing `@/components` directly. Guarded by type rather than
@@ -379,6 +388,7 @@ interface GroupChatSettingsDialogProps {
   group: string
   members?: GroupMember[]
   onClose: () => void
+  onManageMembers?: () => void
   onRenamed?: (group: string) => void
   open: boolean
 }
@@ -386,7 +396,7 @@ interface GroupChatSettingsDialogProps {
 /** Edit an existing group chat's name and picture. Renames re-key the room
  *  and every local member's membership (renameGroupChat); the picture rides
  *  the room record. Both apply on Save so a cancelled dialog changes nothing. */
-function GroupChatSettingsDialog({ group, members, open, onClose, onRenamed }: GroupChatSettingsDialogProps) {
+function GroupChatSettingsDialog({ group, members, open, onClose, onManageMembers, onRenamed }: GroupChatSettingsDialogProps) {
   const { t } = useI18n()
   const b = useBots()
   const rooms: Record<string, GroupChatRoom> = useValue($groupChats)
@@ -453,6 +463,20 @@ function GroupChatSettingsDialog({ group, members, open, onClose, onRenamed }: G
             value={name}
           />
         </form>
+        {onManageMembers ? (
+          <Button
+            className="w-fit"
+            onClick={() => {
+              onClose()
+              onManageMembers()
+            }}
+            size="sm"
+            variant="secondary"
+          >
+            <Codicon name="organization" />
+            {`Manage members (${(members || []).length})…`}
+          </Button>
+        ) : null}
         <DialogFooter>
           <Button onClick={onClose} variant="secondary">
             {t.common.cancel}
@@ -536,6 +560,7 @@ export function GroupChatWorkspace({ group, members, onBack, visible = true }: G
 
   const [confirmDisband, setConfirmDisband] = useState(false)
   const [settingsOpen, setSettingsOpen] = useState(false)
+  const [memberPickerOpen, setMemberPickerOpen] = useState(false)
   // Click-to-disambiguate: which log entry is showing its speaker's full
   // @handle (the roster's name-device form when names collide across
   // connections). Naturally every speaker just shows its display name.
@@ -709,6 +734,17 @@ export function GroupChatWorkspace({ group, members, onBack, visible = true }: G
           <Codicon name="gear" />
         </Button>
       </Tip>
+      <Tip label="Manage members">
+        <Button
+          aria-label="Manage group members"
+          className="shrink-0 text-(--ui-text-tertiary) hover:text-foreground"
+          onClick={() => setMemberPickerOpen(true)}
+          size="sm"
+          variant="ghost"
+        >
+          <Codicon name="organization" />
+        </Button>
+      </Tip>
       <Tip label={b.group.disbandHint(group)}>
         <Button
           aria-label={b.group.disbandLabel(group)}
@@ -723,11 +759,19 @@ export function GroupChatWorkspace({ group, members, onBack, visible = true }: G
     </div>
   )
 
-  const memberDescriptors = () =>
-    members.map(b => ({
+  // Seat from the live sources at send time, not from the painted `members`
+  // prop: a roster save that lands between the last paint and Enter was seen
+  // (live) to send with the removed Bot still seated. Same derivation the
+  // main-tab wrapper paints from; the prop is the fallback when the roster
+  // has not been fetched yet.
+  const memberDescriptors = () => {
+    const seated = groupChatMemberBots(group, $lastRoster.get(), $botMeta.get())
+
+    return (seated.length ? seated : members).map(b => ({
       ...b,
-      title: (b.remoteSource ? '' : allMeta[b.name]?.title) || b.title || ''
+      title: botRosterMeta(b, allMeta)?.title || b.title || ''
     }))
+  }
 
   // Activity disclosure: quiet, collapsed by default. The collapsed row shows
   // the latest event; expanding lists the current run's events newest-first.
@@ -778,7 +822,7 @@ export function GroupChatWorkspace({ group, members, onBack, visible = true }: G
           <Codicon className="shrink-0 text-[0.65rem]" name={activityOpen ? 'chevron-down' : 'chevron-right'} />
           <span className="shrink-0 font-medium">{b.group.activity}</span>
           {summaryActivity ? (
-            <span className={cn('min-w-0 flex-1 truncate', groupActivityTone(summaryActivity.kind))}>{`${groupActivityLabel(summaryActivity)} · ${relativeTime(summaryActivity.at)}`}</span>
+            <span className={cn('min-w-0 flex-1 truncate', groupActivityTone(summaryActivity.kind))}>{`${groupActivityLabel(summaryActivity, group)} · ${relativeTime(summaryActivity.at)}`}</span>
           ) : null}
         </RowButton>
         {room.running ? (
@@ -805,7 +849,7 @@ export function GroupChatWorkspace({ group, members, onBack, visible = true }: G
                   name={GROUP_ACTIVITY_GLYPHS[event.kind] || 'circle-outline'}
                 />
                 <span className={cn('min-w-0 flex-1 truncate', groupActivityTone(event.kind))}>
-                  {groupActivityLabel(event)}
+                  {groupActivityLabel(event, group)}
                 </span>
                 <span className="shrink-0 text-[0.625rem] text-(--ui-text-quaternary)">{relativeTime(event.at)}</span>
                 {event.kind === 'working' ? (
@@ -942,22 +986,57 @@ export function GroupChatWorkspace({ group, members, onBack, visible = true }: G
   }
 
   const attachButton = (thread: null | string) => (
-    <Button
-      className="shrink-0 text-(--ui-text-tertiary) hover:text-foreground"
-      onClick={() => void pickGroupAttachments().then(picked => addImages(thread, picked))}
-      size="sm"
-      title={b.group.attachHint}
-      type="button"
-      variant="ghost"
-    >
-      <Codicon name="attach" />
-    </Button>
+    <Tip label={b.group.attachHint}>
+      <Button
+        aria-label={b.group.attachHint}
+        className="shrink-0 text-(--ui-text-tertiary) hover:text-foreground"
+        onClick={() => void pickGroupAttachments().then(picked => addImages(thread, picked))}
+        size="sm"
+        type="button"
+        variant="ghost"
+      >
+        <Codicon name="attach" />
+      </Button>
+    </Tip>
   )
+
+  // #91359: recognized @mentions render as inline references; recomputed
+  // only when the roster changes since the classifier consults the members.
+  const mentionComponents = useMemo(() => groupMentionComponents(members), [members])
+  const mentionText = useMemo(() => groupMentionText(members), [members])
+
+  // #89883: answer ONE bot from its message. Seeds `@tag ` into the composer
+  // that owns this entry's thread — the open reply box when it is this
+  // thread's, else the main composer — so parseGroupChatMentions routes the
+  // next turn to that member only. Insert-only: the user still sends. The tag
+  // is owner-qualified when a same-named twin shares the friendly form.
+  const replyMentionTag = (entry: GroupMessage, member: GroupMember | null) =>
+    groupReplyMentionTag(member || { name: entry.from.name }, members)
+
+  const replyToMember = (entry: GroupMessage, member: GroupMember | null) => {
+    const tag = replyMentionTag(entry, member)
+
+    if (!tag) {
+      return
+    }
+
+    const seed = (current: string) => (current.includes(`@${tag}`) ? current : `@${tag} ${current}`.replace(/\s+$/, ' '))
+    const thread = groupThreadOf(entry)
+
+    if (replyThread === thread) {
+      setReplyDrafts(prev => ({
+        ...prev,
+        [thread]: seed(prev[thread] || '')
+      }))
+    } else {
+      setDraft(seed)
+    }
+  }
 
   // One log entry, rendered exactly as before conversation folding existed.
   const renderEntry = (entry: GroupMessage, index: number) => {
     const isUser = entry.from.kind === 'user'
-    const meta = isUser || entry.from.source ? null : allMeta[entry.from.name]
+    const meta = groupTranscriptSpeakerMeta(entry, members, allMeta)
 
     // Match this speaker back to its member descriptor so display
     // names and disambiguating handles come from the roster (the
@@ -972,7 +1051,7 @@ export function GroupChatWorkspace({ group, members, onBack, visible = true }: G
         ) || null
 
     const display = isUser
-      ? 'You'
+      ? b.group.you
       : displayName(
           member || {
             name: entry.from.name
@@ -986,15 +1065,14 @@ export function GroupChatWorkspace({ group, members, onBack, visible = true }: G
     // Clicked: append the gateway name so same-named agents on
     // two connections are tellable apart on demand.
     const label = isUser
-      ? 'You'
+      ? b.group.you
       : revealed
         ? `${display}${entry.from.source ? `-${entry.from.source}` : ''} (@${botHandle(entry.from.name, member || undefined)})`
         : display
 
     // Speaker avatar: same appearance pipeline as the roster
     // (custom image/pet, else deterministic shape+color face).
-    // Remote speakers have no local meta and get the
-    // deterministic face for their name — stable per bot.
+    // Source-qualified speakers use owner-aware botRosterMeta (#96432).
     // Non-null exactly when !isUser — the user's own lines carry no avatar.
     const appearance = isUser ? null : botAppearance(entry.from.name, meta)
     const image = appearance?.image ?? null
@@ -1024,20 +1102,34 @@ export function GroupChatWorkspace({ group, members, onBack, visible = true }: G
             {isUser ? (
               <span className="text-[0.7rem] font-semibold text-foreground">{label}</span>
             ) : (
-              <Button
-                className="text-left text-[0.7rem] font-semibold text-(--ui-accent)"
-                onClick={() => setRevealedSpeaker(revealed ? null : entryKey)}
-                size="inline"
-                title={revealed ? 'Hide full handle' : 'Show full handle'}
-                variant="text"
-              >
-                {label}
-              </Button>
+              <Tip label={revealed ? 'Hide full handle' : 'Show full handle'}>
+                <Button
+                  className="text-left text-[0.7rem] font-semibold text-(--ui-accent)"
+                  onClick={() => setRevealedSpeaker(revealed ? null : entryKey)}
+                  size="inline"
+                  variant="text"
+                >
+                  {label}
+                </Button>
+              </Tip>
             )}
             <span className="text-[0.625rem] text-(--ui-text-quaternary)">{relativeTime(entry.at)}</span>
-            {entry.text.trim() ? (
-              <div className="ml-auto shrink-0 opacity-0 pointer-events-none group-hover:pointer-events-auto group-hover:opacity-100 focus-within:pointer-events-auto focus-within:opacity-100">
-                <CopyButton appearance="icon" buttonSize="icon" stopPropagation text={entry.text} />
+            {entry.text.trim() || !isUser ? (
+              <div className="ml-auto flex shrink-0 items-center gap-0.5 opacity-0 pointer-events-none group-hover:pointer-events-auto group-hover:opacity-100 focus-within:pointer-events-auto focus-within:opacity-100">
+                {isUser ? null : (
+                  <Tip label={`Reply to @${replyMentionTag(entry, member)}`}>
+                    <Button
+                      aria-label={`Reply to ${display}`}
+                      className="text-(--ui-text-tertiary) hover:text-foreground"
+                      onClick={() => replyToMember(entry, member)}
+                      size="icon"
+                      variant="ghost"
+                    >
+                      <Codicon name="reply" />
+                    </Button>
+                  </Tip>
+                )}
+                {entry.text.trim() ? <CopyButton appearance="icon" buttonSize="icon" stopPropagation text={entry.text} /> : null}
               </div>
             ) : null}
           </div>
@@ -1045,8 +1137,15 @@ export function GroupChatWorkspace({ group, members, onBack, visible = true }: G
             className={GROUP_MESSAGE_PROSE_CLASS} // The app shell sets user-select: none globally; message bodies opt
             // back in so drag-select and ⌘C work in group chat logs.
             data-selectable-text="true"
+            data-slot="group-chat-message-content"
           >
-            {Streamdown ? <Streamdown>{entry.text}</Streamdown> : entry.text}
+            {MessageTextContent ? (
+              <MessageTextContent decorateText={mentionText} media={!member?.remoteSource} text={entry.text} />
+            ) : Streamdown ? (
+              <Streamdown components={mentionComponents}>{entry.text}</Streamdown>
+            ) : (
+              entry.text
+            )}
           </div>
           {/* User attachments: what every responding bot was */
           /* shown — image previews, or a named chip for */
@@ -1178,7 +1277,10 @@ export function GroupChatWorkspace({ group, members, onBack, visible = true }: G
       />
       {activityPanel}
       <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain">
-        <div className="grid gap-1.5 px-2.5 pb-2">
+        {/* minmax(0,1fr): an implicit grid track is min-content sized, so one */}
+        {/* unbreakable code line widened every entry to its own width and the */}
+        {/* log scrolled sideways as a whole instead of the code block (#91878). */}
+        <div className="grid grid-cols-[minmax(0,1fr)] gap-1.5 px-2.5 pb-2">
           {room.log.length
             ? logChildren
             : [
@@ -1238,8 +1340,10 @@ export function GroupChatWorkspace({ group, members, onBack, visible = true }: G
         group={group}
         members={members}
         onClose={() => setSettingsOpen(false)}
+        onManageMembers={() => setMemberPickerOpen(true)}
         open={settingsOpen}
       />
+      <GroupMemberPicker group={group} members={members} onClose={() => setMemberPickerOpen(false)} open={memberPickerOpen} />
       <ConfirmDialog
         busyLabel={b.group.disbanding}
         confirmLabel={b.group.disbandAction}
@@ -1289,12 +1393,13 @@ function GroupChatMainView({ group }: GroupChatMainViewProps) {
   const roster = useValue($lastRoster)
   const members = groupChatMemberBots(group, roster, allMeta)
 
+
   // Older SDKs have no paneVisibility: fall back to an always-visible atom so
   // the hook order stays stable and behavior matches the previous build.
   const $visible = useMemo(
     () =>
       typeof host.paneVisibility === 'function'
-        ? host.paneVisibility(`plugin-workspace:${ID}:group:${slugify(group)}`)
+        ? host.paneVisibility(`plugin-workspace:${ID}:group:${slugifyProfileName(group)}`)
         : atom(true),
     [group]
   )
@@ -1330,7 +1435,7 @@ export function openGroupChat(group: string): void {
 
   if (typeof host.openWorkspace === 'function') {
     try {
-      const close = host.openWorkspace(`${ID}:group:${slugify(group)}`, {
+      const close = host.openWorkspace(`${ID}:group:${slugifyProfileName(group)}`, {
         title: group,
         minWidth: '24rem',
         render: () => <GroupChatMainView group={group} />,

@@ -107,9 +107,14 @@ def _record_codex_app_server_usage(agent, turn, messages=None) -> dict[str, Any]
                             counts=lambda: billing(billing_mode="subscription_included"))
         return {}
     from agent.usage_pricing import CanonicalUsage, estimate_usage_cost
+    # ``inputTokens`` is INCLUSIVE of ``cachedInputTokens`` (same contract as the Responses API, see
+    # normalize_usage's codex_responses branch); CanonicalUsage.prompt_tokens re-adds cache_read on top of
+    # input_tokens, so the canonical input bucket must be the UNCACHED remainder or cached tokens count twice.
+    cache_read_tokens = _coerce_usage_int(usage.get("cachedInputTokens"))
     canonical_usage = CanonicalUsage(
-        input_tokens=_coerce_usage_int(usage.get("inputTokens")), output_tokens=_coerce_usage_int(usage.get("outputTokens")),
-        cache_read_tokens=_coerce_usage_int(usage.get("cachedInputTokens")), cache_write_tokens=0,
+        input_tokens=max(0, _coerce_usage_int(usage.get("inputTokens")) - cache_read_tokens),
+        output_tokens=_coerce_usage_int(usage.get("outputTokens")),
+        cache_read_tokens=cache_read_tokens, cache_write_tokens=0,
         reasoning_tokens=_coerce_usage_int(usage.get("reasoningOutputTokens")), raw_usage=usage,
     )
     prompt_tokens = canonical_usage.prompt_tokens
@@ -250,7 +255,8 @@ def _codex_item_to_preview(item: dict) -> Any:
 
 
 def _codex_item_completion_payload(item: dict) -> tuple[str, bool]:
-    """(result_text, is_error) for a completed tool item; mirrors the projector's tool-result content."""
+    """(result_text, is_error) for a completed tool item — display-facing text for live tool cards (the
+    persisted history keeps the projector's ``{exit_code, output}`` envelope instead)."""
     item_type = item.get("type") or ""
     if item_type == "commandExecution":
         out, exit_code = item.get("aggregatedOutput") or "", item.get("exitCode")
@@ -336,6 +342,11 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         if isinstance(text, str) and text.strip() and getattr(agent, "show_commentary", True):
             agent_cb("_emit_interim_assistant_message", "_emit_interim_assistant_message raised",
                      args=({"role": "assistant", "content": text},))
+        # Each agentMessage item is its own delivered message: the completed item was just compared
+        # against ITS deltas, so drop them before the next item's deltas arrive. Otherwise the buffer
+        # holds "commentary + final", the final agentMessage no longer prefix-matches, and it is
+        # re-delivered with already_streamed=False as a second copy (#74248 boundary 2).
+        agent._current_streamed_assistant_text = ""
 
     def _on_item(params: dict, completed: bool) -> None:
         item = params.get("item")
@@ -387,6 +398,8 @@ def _ensure_codex_session(agent) -> None:
         return
     from agent.runtime_cwd import resolve_agent_cwd
     from agent.transports.codex_app_server_session import CodexAppServerSession, _ServerRequestRouting
+    from hermes_cli.codex_runtime_switch import get_configured_codex_binary
+    from hermes_cli.config import load_config
     # Approval callback: Hermes' standard prompt flow when a CLI thread installed one.
     approval_callback = None
     with suppress(Exception):
@@ -407,6 +420,7 @@ def _ensure_codex_session(agent) -> None:
     # narrower item/started-only bridge from #38835.
     agent._codex_session = CodexAppServerSession(
         cwd=getattr(agent, "session_cwd", None) or str(resolve_agent_cwd()), approval_callback=approval_callback,
+        codex_bin=get_configured_codex_binary(load_config()),
         request_routing=_ServerRequestRouting(auto_approve_exec=auto_approve_requests, auto_approve_apply_patch=auto_approve_requests),
         on_event=make_codex_app_server_event_bridge(agent),
     )
@@ -490,7 +504,8 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
             final_response=f"Codex app-server turn failed: {exc}. Fall back to default runtime with `/codex-runtime auto`.",
         )
     interrupt = _consume_user_interrupt(agent, turn.interrupted)
-    # Wedged client (deadline blown, watchdog tripped, OAuth refresh died, subprocess exited): retire it.
+    # Wedged client (turn deadline blown, OAuth refresh died, subprocess exited): retire it. Post-tool
+    # silence alone no longer retires — it only logs a warning (#112928).
     if getattr(turn, "should_retire", False):
         logger.warning("codex app-server session retired (turn error: %s)", turn.error)
         _close_codex_session(agent)

@@ -725,7 +725,7 @@ def _init_anthropic_client(agent, api_key, base_url, _provider_timeout):
     # must use their own key or Anthropic credentials leak to third-party endpoints.
     # Falling back would send Anthropic credentials to third-party endpoints (Fixes #1739, #minimax-401).
     _is_native_anthropic = agent.provider == "anthropic"
-    effective_key = api_key or (resolve_anthropic_token() if _is_native_anthropic else None) or ""
+    effective_key = api_key or (resolve_anthropic_token(model=getattr(agent, "model", None)) if _is_native_anthropic else None) or ""
 
     # MiniMax OAuth tokens live ~15 min and the SDK freezes api_key at construction, so use a
     # callable provider: build_anthropic_client mints a fresh bearer per request (re-reading
@@ -759,9 +759,7 @@ def _init_anthropic_client(agent, api_key, base_url, _provider_timeout):
 
 def _init_moa_client(agent, api_key):
     """provider == "moa": virtual Mixture-of-Agents facade, no real HTTP client."""
-    from agent.moa_loop import build_moa_facade
-    agent.api_mode = "chat_completions"
-
+    from agent.moa_loop import bind_moa_runtime
     # build_moa_facade relays "moa.*" events through tool_progress_callback so every surface
     # shows each reference's answer before the aggregator acts. Display-only; shared with
     # fallback-restore so a restored facade keeps emitting.
@@ -771,10 +769,7 @@ def _init_moa_client(agent, api_key):
     # facade emits "moa.reference", "moa.progress", "moa.phase", and "moa.aggregating" events, forwarded
     # through the same callback the tool lifecycle uses. Best-effort and cache-safe — display-only events,
     # they never touch the message history. See #53802.
-    agent.client = build_moa_facade(agent, agent.model)
-    agent._client_kwargs = {}
-    agent.api_key = api_key or "moa-virtual-provider"
-    agent.base_url = "moa://local"
+    bind_moa_runtime(agent, agent.model, api_key)
     if not agent.quiet_mode:
         print(f"🤖 AI Agent initialized with MoA preset: {agent.model}")
 
@@ -800,14 +795,6 @@ def _explicit_client_kwargs(agent, api_key, base_url, _provider_timeout) -> Dict
     if agent.provider == "copilot-acp":
         client_kwargs["command"] = agent.acp_command
         client_kwargs["args"] = agent.acp_args
-    # OpenCode Zen free tier is served ANONYMOUSLY and 401s any bearer (incl. our keyless
-    # placeholder): send an empty Authorization header to override the SDK's "Bearer <key>".
-    with suppress(Exception):
-        from hermes_cli.models import (
-            OPENCODE_ZEN_FREE_KEYLESS_PLACEHOLDER, opencode_zen_free_headers
-        )
-        if api_key == OPENCODE_ZEN_FREE_KEYLESS_PLACEHOLDER:
-            client_kwargs["default_headers"] = opencode_zen_free_headers()
     _headers_for = _host_default_headers_factory(base_url)
     if _headers_for is not None:
         client_kwargs["default_headers"] = _headers_for(api_key, base_url)
@@ -822,11 +809,12 @@ def _explicit_client_kwargs(agent, api_key, base_url, _provider_timeout) -> Dict
     return client_kwargs
 
 
-def _routed_client_kwargs(agent, fallback_model, _provider_timeout) -> Dict[str, Any]:
+def _routed_client_kwargs(agent, fallback_model, _provider_timeout) -> Optional[Dict[str, Any]]:
     """OpenAI-client kwargs via the centralized provider router (no explicit creds).
 
     Falls through to the init-time fallback chain, then raises with the missing-key /
-    no-provider diagnostic.
+    no-provider diagnostic. ``None`` when the chain landed on a MoA preset: the facade is
+    already bound and there is no OpenAI client to construct.
     """
     from agent.auxiliary_client import resolve_provider_client
     _routed_client, _ = resolve_provider_client(
@@ -856,24 +844,21 @@ def _routed_client_kwargs(agent, fallback_model, _provider_timeout) -> Dict[str,
             logger.debug("Init-time fallback entry %s failed: %s", _fb.get("provider"), _fb_exc)
             continue
         if _fb_client is not None:
+            agent._fallback_activated = True
+            if str(_fb["provider"]).strip().lower() == "moa":
+                # The chokepoint handed back the preset's aggregator client, which only proves the
+                # preset resolves and its aggregator has credentials. A MoA entry means the preset
+                # itself (same as ``provider: moa`` in config), so bind the facade, not the aggregator.
+                from agent.moa_loop import bind_moa_runtime
+                bind_moa_runtime(agent, _fb["model"])
+                return None
             agent.provider = _fb["provider"]
             agent.model = _fb_model or _fb["model"]
-            agent._fallback_activated = True
             return _client_kwargs_from_routed(_fb_client, _provider_timeout)
     if _explicit and _explicit not in {"auto", "openrouter", "custom"}:
         # Explicit non-OpenRouter provider with no creds and no usable fallback: fail fast.
-        # Use the provider's real env var name (alibaba → DASHSCOPE_API_KEY).
-        _env_hint = f"{_explicit.upper()}_API_KEY"
-        with suppress(Exception):
-            from hermes_cli.auth import PROVIDER_REGISTRY
-            _pcfg = PROVIDER_REGISTRY.get(_explicit)
-            if _pcfg and _pcfg.api_key_env_vars:
-                _env_hint = _pcfg.api_key_env_vars[0]
-        raise RuntimeError(
-            f"Provider '{_explicit}' is set in config.yaml but no API key "
-            f"was found. Set the {_env_hint} environment "
-            f"variable, or switch to a different provider with `hermes model`."
-        )
+        from agent.auxiliary_unavailable import missing_provider_credentials_message
+        raise RuntimeError(missing_provider_credentials_message(_explicit))
     from hermes_constants import profile_cli_selector
     _sel = profile_cli_selector()
     raise RuntimeError(
@@ -921,6 +906,10 @@ def _init_openai_client(agent, api_key, base_url, fallback_model, _provider_time
         client_kwargs = _explicit_client_kwargs(agent, api_key, base_url, _provider_timeout)
     else:
         client_kwargs = _routed_client_kwargs(agent, fallback_model, _provider_timeout)
+        if client_kwargs is None:  # init-time fallback bound the MoA facade
+            if not agent.quiet_mode:
+                print(f"🤖 AI Agent initialized with MoA preset: {agent.model}")
+            return
     from hermes_cli.providers import is_actual_route
     if is_actual_route(agent.provider, client_kwargs.get("base_url", "")):
         agent.api_mode = "chat_completions"
@@ -945,7 +934,9 @@ def _init_openai_client(agent, api_key, base_url, fallback_model, _provider_time
             print(f"🤖 AI Agent initialized with model: {agent.model}")
             if base_url:
                 print(f"🔗 Using custom base URL: {base_url}")
-            _print_key_banner(client_kwargs.get("api_key", "none"), "API key", warn_missing=True)
+            from gateway.warning_notifications import warning_notifications_enabled
+            _print_key_banner(client_kwargs.get("api_key", "none"), "API key",
+                              warn_missing=warning_notifications_enabled(agent.platform))
     except Exception as e:
         raise RuntimeError(f"Failed to initialize OpenAI client: {e}")
 
@@ -1068,12 +1059,18 @@ def _load_tools(agent, enabled_toolsets, disabled_toolsets):
         enabled_toolsets=enabled_toolsets, disabled_toolsets=disabled_toolsets,
         quiet_mode=agent.quiet_mode,
     )
+    # A finite -q run has no later session to learn for: no skill authoring tool (agent/oneshot_footprint.py).
+    from agent.oneshot_footprint import prune_oneshot_tools
+    agent.tools = prune_oneshot_tools(agent.tools or [])
 
     agent.valid_tool_names = {tool["function"]["name"] for tool in agent.tools} if agent.tools else set()
-    # Kanban guidance is session-static (kanban_show iff HERMES_KANBAN_TASK); resolve once.
+    # Kanban guidance is session-static for the dispatcher-owned worker only. Profiles may
+    # expose kanban_show interactively, and children/cron runs inherit the env var, without
+    # owning a task.
+    from agent.delegation_context import owned_kanban_task
     from agent.prompt_builder import KANBAN_GUIDANCE
     agent._kanban_worker_guidance = (
-        KANBAN_GUIDANCE if "kanban_show" in agent.valid_tool_names else ""
+        KANBAN_GUIDANCE if owned_kanban_task() and "kanban_show" in agent.valid_tool_names else ""
     )
     if agent.quiet_mode:
         return
@@ -1087,7 +1084,7 @@ def _load_tools(agent, enabled_toolsets, disabled_toolsets):
         requirements = model_tools.check_toolset_requirements()
         missing_reqs = [name for name, available in requirements.items() if not available]
         if missing_reqs:
-            print(f"⚠️  Some tools may not work due to missing requirements: {missing_reqs}")
+            agent._safe_print(f"⚠️  Some tools may not work due to missing requirements: {missing_reqs}", diagnostic=True)
     else:
         print("🛠️  No tools loaded (all tools filtered out or unavailable)")
     if agent.save_trajectories:
@@ -1206,7 +1203,8 @@ def _memory_provider_init_kwargs(agent, platform) -> Dict[str, Any]:
         "session_id": agent.session_id,
         "platform": platform or "cli",
         "hermes_home": str(get_hermes_home()),
-        "agent_context": "primary",
+        # platform="cron" (scheduler) / "subagent" (delegate_task) → providers skip writes (MemoryProvider.initialize).
+        "agent_context": platform if platform in ("cron", "subagent") else "primary",
     }
     if kwargs["platform"] == "cli":
         kwargs["warning_callback"] = agent._emit_warning
@@ -1285,6 +1283,11 @@ def _init_memory(agent, _agent_cfg, skip_memory, platform):
                 from plugins.memory import load_memory_provider as _load_mem
                 agent._memory_manager = _MemoryManager()
                 _mp = _load_mem(_mem_provider_name)
+                if _mp is None:
+                    # The provider left core for the catalog (or was never installed): fetch it once.
+                    from hermes_cli.memory_provider_migration import recover_at_startup
+                    if recover_at_startup(_mem_provider_name):
+                        _mp = _load_mem(_mem_provider_name)
                 if _mp and _mp.is_available():
                     agent._memory_manager.add_provider(_mp)
                 elif _mp is not None and _mem_provider_name not in _warned_unavailable_providers:
@@ -1512,12 +1515,23 @@ def _parse_compression_config(agent, _agent_cfg) -> CompressionSettings:
 
 def _warn_invalid_config_int(
     what: str, value: Any, requirement: str, fallback: str, print_fallback: str = "",
+    agent: Any = None,
 ) -> None:
     """Log + stderr-print an invalid integer config value (``print_fallback``: user-facing
-    wording where it differs from the log line)."""
+    wording where it differs from the log line). The print is an automatic diagnostic and
+    honors the warning-notification policy; the log line never does."""
     _ra().logger.warning(
         "Invalid %s: %r — %s. Falling back to %s.", what, value, requirement, fallback,
     )
+    from gateway.warning_notifications import warning_notifications_enabled
+    try:
+        if not warning_notifications_enabled(
+            getattr(agent, "_notification_platform", getattr(agent, "platform", "cli")),
+            getattr(agent, "_notification_config", None),
+        ):
+            return
+    except Exception:
+        pass
     print(
         f"\n⚠ Invalid {what}: {value!r}\n"
         f"  {requirement[0].upper() + requirement[1:]}.\n"
@@ -1671,6 +1685,7 @@ def _warn_invalid_custom_provider_context_length(agent, _custom_providers) -> No
             _warn_invalid_config_int(
                 f"context_length for model {agent.model!r} in custom_providers",
                 _cp_ctx, _CTX_LEN_REQUIREMENT, "auto-detection", "auto-detected context window",
+                agent=agent,
             )
         return
 
@@ -1698,7 +1713,7 @@ def _resolve_context_length(agent, _agent_cfg, base_url):
             _warn_invalid_config_int(
                 "model.context_length in config.yaml", _config_context_length,
                 "must be a plain integer (e.g. 256000, not '256K')",
-                "auto-detection", "auto-detected context window",
+                "auto-detection", "auto-detected context window", agent=agent,
             )
             _config_context_length = None
 
@@ -1882,6 +1897,8 @@ def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_c
         if hasattr(_cc, _attr):
             setattr(_cc, _attr, _value)
     agent.compression_checkpoint_required = cs.checkpoint_required
+    from agent.conversation_compression import _warn_checkpoint_required_without_capable_provider
+    _warn_checkpoint_required_without_capable_provider(agent)
     agent.codex_app_server_auto_compaction = cs.codex_app_server_auto
     agent.codex_responses_native_compaction = cs.codex_responses_native
     agent.codex_responses_compact_threshold = cs.codex_responses_compact_threshold
@@ -1898,6 +1915,11 @@ def _enforce_minimum_context(agent):
     # Reject windows below the 64K floor needed for reliable tool-calling; an explicit
     # positive model.context_length on LM Studio is allowed below the floor.
     _ctx = getattr(agent.context_compressor, "context_length", 0)
+    # A local Ollama server serves num_ctx, not the GGUF's advertised window: a Modelfile or
+    # model.ollama_num_ctx at 64K+ is a usable window even when the metadata says 40K (#100437).
+    # Only a local endpoint can honour num_ctx, so a stale override never admits a hosted model.
+    if agent._ollama_num_ctx and agent.base_url and is_local_endpoint(agent.base_url):
+        _ctx = max(_ctx or 0, agent._ollama_num_ctx)
     _allow_lmstudio_explicit_below_floor = (
         str(agent.provider or "").strip().lower() == "lmstudio"
         and isinstance(agent._config_context_length, int)
@@ -2024,6 +2046,9 @@ def _configure_ollama_num_ctx(agent, _model_cfg, _config_context_length):
             "Ollama num_ctx: will request %d tokens (model max from /api/show)",
             agent._ollama_num_ctx,
         )
+
+
+def _clamp_compressor_to_ollama_num_ctx(agent):
     # Recalibrate the compressor to the served window: every request runs at num_ctx, so a
     # trigger derived from the probed model window could sit above it and never fire.
     # A config that sets only model.ollama_num_ctx (without model.context_length) previously left the
@@ -2067,13 +2092,15 @@ def _emit_compression_summary(agent, cs):
             # The active engine's own threshold — a plugin's differs from cs.threshold.
             _pct = getattr(_cc, "threshold_percent", cs.threshold)
             _cap = getattr(_cc, "threshold_tokens_cap", None)
-            _cap_note = f" (capped at {_cap:,} tokens)" if _cap and _cap > 0 else ""
+            # Name the cap only when it is what set the trigger; on small windows the ratio already sits below it.
+            _cap_binds = bool(_cap) and _cap > 0 and _cc.threshold_tokens == min(_cap, _cc.context_length)
+            _cap_note = f" (capped at {_cap:,} tokens)" if _cap_binds else ""
             print(f"📊 Context limit: {_cc.context_length:,} tokens (compress at {int(_pct*100)}% = {_cc.threshold_tokens:,}{_cap_note})")
         else:
             print(f"📊 Context limit: {_cc.context_length:,} tokens (auto-compression disabled)")
         # Gateway users get the same text via _compression_warning on turn 1.
         if _autoraise_notice:
-            print(_autoraise_notice)
+            agent._safe_print(_autoraise_notice, diagnostic=True)
 
     # status_callback isn't wired yet: stash for replay on the first turn; mark shown so
     # repeated inits stay silent.
@@ -2312,11 +2339,12 @@ def init_agent(
         agent, _agent_cfg, base_url
     )
     _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_context_length, session_db)
+    _configure_ollama_num_ctx(agent, _model_cfg, _config_context_length)
     _enforce_minimum_context(agent)
     _warn_nonagentic_hermes_model(agent)
     _inject_context_engine_tools(agent)
     _init_usage_state(agent)
-    _configure_ollama_num_ctx(agent, _model_cfg, _config_context_length)
+    _clamp_compressor_to_ollama_num_ctx(agent)
     _emit_compression_summary(agent, cs)
     _snapshot_primary_runtime(agent)
 

@@ -3,16 +3,19 @@
 from types import SimpleNamespace
 
 import pytest
+
 from agent.error_classifier import (
     ClassifiedError,
     FailoverReason,
     PROVIDER_STREAM_NON_JSON_ERROR_CODE,
     classify_api_error,
+    is_reasoning_field_rejection,
     _extract_status_code,
     _extract_error_body,
     _extract_error_code,
     _classify_402,
 )
+from tests.hermes_cli.anon_portal import make_jwt
 
 
 # ── Helper: mock API errors ────────────────────────────────────────────
@@ -62,12 +65,13 @@ class TestFailoverReason:
             "ssl_cert_verification",
             "context_overflow", "payload_too_large", "image_too_large",
             "image_corrupt",
-            "model_not_found", "format_error",
+            "model_not_found", "format_error", "role_alternation",
             "invalid_encrypted_content",
             "multimodal_tool_content_unsupported",
             "reasoning_mandatory",
             "provider_policy_blocked",
             "content_policy_blocked",
+            "model_entitlement",
             "thinking_signature", "long_context_tier",
             "oauth_long_context_beta_forbidden",
             "llama_cpp_grammar_pattern",
@@ -856,6 +860,27 @@ class TestClassifyApiError:
         e = MockAPIError("Error code: 400 - " + body["message"], status_code=400, body=body)
         assert classify_api_error(e, provider=provider, model="gpt-5.5").reason == expected
 
+    @pytest.mark.parametrize(("provider", "body", "expected"), [
+        ("openai-codex", {"detail": "Unsupported content type"}, FailoverReason.invalid_encrypted_content),
+        # Some SDK paths surface only the wrapped message text, no parsed body.
+        ("openai-codex", None, FailoverReason.invalid_encrypted_content),
+        ("openai", {"detail": "Unsupported content type"}, FailoverReason.format_error),  # elsewhere a genuine shape 400
+    ], ids=["codex-dict-body", "codex-message-only", "other-provider"])
+    def test_codex_unsupported_content_type_detail_reaches_replay_strip(self, provider, body, expected):
+        """#51512: the ChatGPT Codex backend rejects a replayed encrypted-reasoning item as a bare
+        ``{"detail": "Unsupported content type"}`` 400; only the codex provider maps it to the replay strip."""
+        e = MockAPIError("Error code: 400 - {'detail': 'Unsupported content type'}", status_code=400, body=body)
+        assert classify_api_error(e, provider=provider, model="gpt-5.5").reason == expected
+
+    def test_thinking_signature_invalid_uses_encrypted_replay_recovery(self):
+        """#70595: the OpenAI code contains "thinking" + "signature", so it must beat the Anthropic
+        thinking-block heuristic and reach the one-shot encrypted-replay strip (retry, no fallback)."""
+        body = {"error": {"code": "thinking_signature_invalid", "message": "The reasoning signature is no longer valid."}}
+        e = MockAPIError(f"Error code: 400 - {body}", status_code=400, body=body)
+        result = classify_api_error(e, provider="openai", model="gpt-5.5")
+        assert result.reason == FailoverReason.invalid_encrypted_content
+        assert result.retryable is True and result.should_fallback is False
+
     @pytest.mark.parametrize(("provider", "model", "message", "code"), [
         ("azure-foundry", "gpt-6-astra", "Conflicting authenticated continuation identities.", "invalid_value"),
         # Custom Responses endpoint wraps the replay rejection in a generic bad_request (#95834).
@@ -888,6 +913,37 @@ class TestClassifyApiError:
         assert result.retryable is True
         assert result.should_fallback is False
         assert result.should_compress is False
+
+    def test_reasoning_field_rejection_is_reasoning_mandatory(self):
+        """A 400 rejecting a reasoning wire control by name — reversed ("reasoning_effort 'none'
+        unsupported; use ...", #114460) or forward ("Unrecognized request argument supplied:
+        reasoning_effort") — takes the drop-the-disable rung, not the format_error abort; a
+        model-id segment (kimi-k2-thinking) stays route gating."""
+        for msg in (
+            "Error code: 400 - reasoning_effort 'none' unsupported; use minimal|low|medium|high|xhigh",
+            "Unrecognized request argument supplied: reasoning_effort",
+        ):
+            result = classify_api_error(MockAPIError(msg, status_code=400), provider="custom", model="m")
+            assert result.reason == FailoverReason.reasoning_mandatory, msg
+            assert result.retryable is True and result.should_fallback is False
+        gated = classify_api_error(
+            MockAPIError("The model kimi-k2-thinking is not supported when using this account", status_code=400),
+            provider="custom", model="kimi-k2-thinking",
+        )
+        assert gated.reason != FailoverReason.reasoning_mandatory
+
+    def test_openai_unsupported_none_effort_body_is_reasoning_mandatory(self):
+        """OpenAI's real 400 for ``reasoning.effort: none`` on a model whose ladder has no ``none`` (o3/o4-mini,
+        gpt-5/gpt-5-codex; ``none`` is gpt-5.1+): the SDK message carries the body — ``param: reasoning.effort``
+        plus ``code: unsupported_value`` — and must take the drop-the-disable retry rung, not a format abort."""
+        body = {"error": {"message": "Unsupported value: 'none' is not supported with this model. Supported values "
+                                     "are: 'low', 'medium', and 'high'.",
+                          "type": "invalid_request_error", "param": "reasoning.effort", "code": "unsupported_value"}}
+        msg = f"Error code: 400 - {body}"
+        assert is_reasoning_field_rejection(msg)
+        result = classify_api_error(MockAPIError(msg, status_code=400, body=body), provider="openai-api", model="o4-mini")
+        assert result.reason == FailoverReason.reasoning_mandatory
+        assert result.retryable is True and result.should_fallback is False
 
     # ── Provider-specific: llama.cpp grammar-parse ──
 
@@ -996,6 +1052,15 @@ class TestClassifyApiError:
 
 
 
+    def test_message_account_id_token_extraction_failure_is_auth(self):
+        """Codex 'Failed to extract accountId from token' without a status is an
+        auth failure: no retry on the same credential, rotate, fall back (#72911)."""
+        e = Exception("Failed to extract accountId from token")
+        result = classify_api_error(e, provider="openai-codex")
+        assert result.reason == FailoverReason.auth
+        assert result.retryable is False
+        assert result.should_rotate_credential is True
+        assert result.should_fallback is True
 
 
     # ── Message-only usage limit disambiguation (no status code) ──
@@ -1796,7 +1861,7 @@ class TestNousWelcomeTier:
 
     def test_model_not_free_is_a_non_retryable_gate_with_fallback(self):
         err = self._refusal("model_not_free", alternates=["nous/welcome"], upgrade_url="https://portal.example/upgrade")
-        result = classify_api_error(err, provider="nous", model="gpt-5")
+        result = classify_api_error(err, provider="nous", api_key=make_jwt(), model="gpt-5")
         assert result.reason == FailoverReason.model_not_found
         assert result.retryable is False
         assert result.should_fallback is True
@@ -1807,13 +1872,13 @@ class TestNousWelcomeTier:
         assert refusal["upgrade_url"] == "https://portal.example/upgrade"
 
     def test_feature_not_free_is_the_same_gate(self):
-        result = classify_api_error(self._refusal("feature_not_free"), provider="nous")
+        result = classify_api_error(self._refusal("feature_not_free"), provider="nous", api_key=make_jwt())
         assert result.reason == FailoverReason.model_not_found
         assert result.retryable is False
 
     @pytest.mark.parametrize("reason", ["at_capacity", "admission_closed", "rate_limited"])
     def test_capacity_refusals_are_rate_limits_that_honour_retry_after(self, reason):
-        result = classify_api_error(self._refusal(reason, retry_after=30), provider="nous", model="nous/welcome")
+        result = classify_api_error(self._refusal(reason, retry_after=30), provider="nous", api_key=make_jwt(), model="nous/welcome")
         assert result.reason == FailoverReason.rate_limit
         assert result.retryable is True
         assert result.should_fallback is True
@@ -1822,19 +1887,19 @@ class TestNousWelcomeTier:
         assert ctx["reset_at"] > 0
 
     def test_retry_after_zero_carries_no_reset(self):
-        result = classify_api_error(self._refusal("at_capacity", retry_after=0), provider="nous")
+        result = classify_api_error(self._refusal("at_capacity", retry_after=0), provider="nous", api_key=make_jwt())
         assert "reset_at" not in result.error_context
 
     def test_unknown_reason_is_not_the_welcome_shape(self):
         err = MockAPIError("Error code: 429", status_code=429,
                            body={"status": 429, "message": "x", "reason": "something_else", "retry_after": 5})
-        result = classify_api_error(err, provider="nous")
+        result = classify_api_error(err, provider="nous", api_key=make_jwt())
         assert "welcome_refusal" not in result.error_context
 
     def test_anonymous_jwt_on_the_paid_host_is_deterministic(self):
         body = {"status": 400, "message": "Anonymous accounts must use https://welcome-api.nousresearch.com for inference."}
         err = MockAPIError(f"Error code: 400 - {body}", status_code=400, body=body)
-        result = classify_api_error(err, provider="nous", model="nous/welcome")
+        result = classify_api_error(err, provider="nous", api_key=make_jwt(), model="nous/welcome")
         assert result.reason == FailoverReason.format_error
         assert result.retryable is False and result.should_fallback is True
         assert result.error_context["welcome_route"] == "anon_on_paid_host"
@@ -1842,20 +1907,38 @@ class TestNousWelcomeTier:
     def test_named_caller_on_the_welcome_host_is_deterministic(self):
         body = {"status": 400, "message": "This endpoint serves anonymous Hermes Agent accounts only. Use https://inference-api.nousresearch.com with your API key or signed-in account."}
         err = MockAPIError(f"Error code: 400 - {body}", status_code=400, body=body)
-        result = classify_api_error(err, provider="nous")
+        result = classify_api_error(err, provider="nous", api_key=make_jwt(account_tier="free"))
         assert result.error_context["welcome_route"] == "named_on_welcome_host"
         assert result.retryable is False
 
     def test_dark_tier_403_never_triggers_a_credential_refresh(self):
         body = {"status": 403, "message": "Anonymous accounts are not accepted by this API right now."}
         err = MockAPIError(f"Error code: 403 - {body}", status_code=403, body=body)
-        result = classify_api_error(err, provider="nous", model="nous/welcome")
+        result = classify_api_error(err, provider="nous", api_key=make_jwt(), model="nous/welcome")
         assert result.reason == FailoverReason.auth_permanent
         assert result.retryable is False and result.should_fallback is True
         assert result.should_rotate_credential is False
         assert result.error_context["welcome_route"] == "tier_disabled"
 
     def test_ordinary_403_is_untouched(self):
-        result = classify_api_error(MockAPIError("forbidden", status_code=403, body={"message": "forbidden"}), provider="nous")
+        result = classify_api_error(MockAPIError("forbidden", status_code=403, body={"message": "forbidden"}), provider="nous", api_key=make_jwt())
         assert result.reason == FailoverReason.auth
         assert "welcome_route" not in result.error_context
+
+
+class TestAuthErrorNamesOffRouteEndpoint:
+    """#113719: an auth refusal from a route that is not the provider's own endpoint names the host."""
+
+    _BODY = {"error": {"code": "api_key_not_supported", "message": "API keys are not supported by this endpoint."}}
+
+    def test_stale_base_url_names_contacted_host(self):
+        e = MockAPIError("Unauthorized", status_code=401, body=self._BODY)
+        result = classify_api_error(e, provider="anthropic", model="claude", base_url="https://chatgpt.com/backend-api/codex")
+        assert result.reason == FailoverReason.auth
+        assert result.message == "API keys are not supported by this endpoint. (endpoint: chatgpt.com)"
+
+    def test_stock_endpoint_and_no_base_url_keep_plain_message(self):
+        e = MockAPIError("Unauthorized", status_code=401, body=self._BODY)
+        for base_url in ("", "https://api.anthropic.com/v1"):
+            result = classify_api_error(e, provider="anthropic", model="claude", base_url=base_url)
+            assert result.message == "API keys are not supported by this endpoint.", base_url
